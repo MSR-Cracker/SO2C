@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "so2c"
+version = "1.0.0"
+description = "Android shared-object analysis, deobfuscation and decompilation"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "SO2C" }]
+keywords = ["android", "elf", "jni", "decompiler", "so", "reverse-engineering"]
+dependencies = [
+    "capstone>=5.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+so2c = "so2c.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+so2c = ["py.typed"]
