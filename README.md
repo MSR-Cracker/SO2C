@@ -46,7 +46,7 @@ python -m so2c input/lib.so -o output
 #    output/summary/analysis.json  - full machine-readable analysis
 #    output/summary/strings.txt    - extracted string constants
 #    output/summary/exports.txt    - recovered exported symbols
-#    output/decompiled/*.c/.h      - reconstructed C pseudo-source
+#    output/decompiled/*.cpp/.h    - reconstructed C++ pseudo-source
 ```
 
 ## GitHub Actions
@@ -57,7 +57,7 @@ The repository ships `.github/workflows/decompile.yml`, triggered manually via
 1. checks out the repository (with `input/lib.so`)
 2. installs Python + `capstone`
 3. runs the SO2C pipeline against `input/lib.so`
-4. uploads all generated output (summary JSON/text and decompiled C/C++)
+4. uploads all generated output (summary JSON/text and decompiled pseudo-C++)
    as a downloadable **GitHub Actions artifact**
 
 To run it: open the Actions tab -> *Decompile .so* -> **Run workflow**.
@@ -81,11 +81,12 @@ src/so2c/
 
 ## Notes on fidelity
 
-We are *deliberately conservative*: the decompiled C is a faithful,
-readable reconstruction (a debugger-style linear listing with resolved string,
-import, and JNI references) rather than a full register-tracking decompiler.
-Everything the tool prints is derived from ELF metadata or real instruction
-decoding, never guessed past what the binary proves.
+We are *deliberately conservative*: the decompiled C++ is a faithful,
+readable reconstruction using AArch64 register tracking — it recovers JNI
+vtable lookups, argument-passing patterns, stack canary checks, and method
+descriptor strings to emit real `jclass`/`jmethodID`/`jvalue` expressions.
+Where the lifter cannot determine meaning it emits a comment with the raw
+instruction, never a guess beyond what the binary proves.
 
 ## License
 

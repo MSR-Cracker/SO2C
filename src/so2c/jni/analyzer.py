@@ -9,7 +9,10 @@ from dataclasses import dataclass, field
 from ..elf.reader import ELFReader
 from ..elf.symbols import collect_exports
 
-# Standard Android JNINativeInterface function indices (jni.h).
+# Standard JNI function indices — Oracle / Sun spec ordering (as used by
+# NDK / dex2c output).  AOSP's jni.h reverses the string-operation block
+# (indices 164-170) but the NDK toolchain historically shipped the Sun
+# ordering which is what the observed binaries use.
 # index -> method name
 JNI_FUNCS = {
     4: "GetVersion", 5: "DefineClass", 6: "FindClass",
@@ -78,41 +81,58 @@ JNI_FUNCS = {
     156: "SetStaticByteField", 157: "SetStaticCharField",
     158: "SetStaticShortField", 159: "SetStaticIntField",
     160: "SetStaticLongField", 161: "SetStaticFloatField",
-    162: "SetStaticDoubleField", 163: "NewString", 164: "NewStringUTF",
-    165: "GetStringUTFLength", 166: "GetStringUTFChars",
-    167: "ReleaseStringUTFChars", 168: "GetStringLength",
-    169: "GetStringChars", 170: "ReleaseStringChars",
-    171: "NewObjectArray", 172: "GetObjectArrayElement",
-    173: "SetObjectArrayElement", 174: "NewBooleanArray",
-    175: "NewByteArray", 176: "NewCharArray", 177: "NewShortArray",
-    178: "NewIntArray", 179: "NewLongArray", 180: "NewFloatArray",
-    181: "NewDoubleArray", 182: "GetArrayLength", 183: "NewObjectArrayEx",
-    184: "GetBooleanArrayElements", 185: "GetByteArrayElements",
-    186: "GetCharArrayElements", 187: "GetShortArrayElements",
-    188: "GetIntArrayElements", 189: "GetLongArrayElements",
-    190: "GetFloatArrayElements", 191: "GetDoubleArrayElements",
-    192: "ReleaseBooleanArrayElements", 193: "ReleaseByteArrayElements",
-    194: "ReleaseCharArrayElements", 195: "ReleaseShortArrayElements",
-    196: "ReleaseIntArrayElements", 197: "ReleaseLongArrayElements",
-    198: "ReleaseFloatArrayElements", 199: "ReleaseDoubleArrayElements",
-    200: "GetBooleanArrayRegion", 201: "GetByteArrayRegion",
-    202: "GetCharArrayRegion", 203: "GetShortArrayRegion",
-    204: "GetIntArrayRegion", 205: "GetLongArrayRegion",
-    206: "GetFloatArrayRegion", 207: "GetDoubleArrayRegion",
-    208: "SetBooleanArrayRegion", 209: "SetByteArrayRegion",
-    210: "SetCharArrayRegion", 211: "SetShortArrayRegion",
-    212: "SetIntArrayRegion", 213: "SetLongArrayRegion",
-    214: "SetFloatArrayRegion", 215: "SetDoubleArrayRegion",
-    216: "RegisterNatives", 217: "UnregisterNatives",
-    218: "MonitorEnter", 219: "MonitorExit", 220: "GetJavaVM",
-    221: "GetStringRegion", 222: "GetStringUTFRegion",
-    223: "GetPrimitiveArrayCritical", 224: "ReleasePrimitiveArrayCritical",
-    225: "GetStringCritical", 226: "ReleaseStringCritical",
-    227: "NewWeakGlobalRef", 228: "DeleteWeakGlobalRef",
-    229: "ExceptionCheck", 230: "NewDirectByteBuffer",
-    231: "GetDirectBufferAddress", 232: "GetDirectBufferCapacity",
-    233: "GetObjectRefType",
+    162: "SetStaticDoubleField",
+    # Oracle / Sun spec: string ops differ from AOSP.
+    163: "NewString",
+    164: "GetStringLength", 165: "GetStringChars", 166: "ReleaseStringChars",
+    167: "NewStringUTF",
+    168: "GetStringUTFLength", 169: "GetStringUTFChars",
+    170: "ReleaseStringUTFChars",
+    171: "GetArrayLength",
+    172: "NewObjectArray", 173: "GetObjectArrayElement",
+    174: "SetObjectArrayElement", 175: "NewBooleanArray",
+    176: "NewByteArray", 177: "NewCharArray", 178: "NewShortArray",
+    179: "NewIntArray", 180: "NewLongArray", 181: "NewFloatArray",
+    182: "NewDoubleArray", 183: "GetBooleanArrayElements",
+    184: "GetByteArrayElements", 185: "GetCharArrayElements",
+    186: "GetShortArrayElements", 187: "GetIntArrayElements",
+    188: "GetLongArrayElements", 189: "GetFloatArrayElements",
+    190: "GetDoubleArrayElements", 191: "ReleaseBooleanArrayElements",
+    192: "ReleaseByteArrayElements", 193: "ReleaseCharArrayElements",
+    194: "ReleaseShortArrayElements", 195: "ReleaseIntArrayElements",
+    196: "ReleaseLongArrayElements", 197: "ReleaseFloatArrayElements",
+    198: "ReleaseDoubleArrayElements", 199: "GetBooleanArrayRegion",
+    200: "GetByteArrayRegion", 201: "GetCharArrayRegion",
+    202: "GetShortArrayRegion", 203: "GetIntArrayRegion",
+    204: "GetLongArrayRegion", 205: "GetFloatArrayRegion",
+    206: "GetDoubleArrayRegion", 207: "SetBooleanArrayRegion",
+    208: "SetByteArrayRegion", 209: "SetCharArrayRegion",
+    210: "SetShortArrayRegion", 211: "SetIntArrayRegion",
+    212: "SetLongArrayRegion", 213: "SetFloatArrayRegion",
+    214: "SetDoubleArrayRegion", 215: "RegisterNatives",
+    216: "UnregisterNatives", 217: "MonitorEnter", 218: "MonitorExit",
+    219: "GetJavaVM", 220: "GetStringRegion", 221: "GetStringUTFRegion",
+    222: "GetPrimitiveArrayCritical", 223: "ReleasePrimitiveArrayCritical",
+    224: "GetStringCritical", 225: "ReleaseStringCritical",
+    226: "NewWeakGlobalRef", 227: "DeleteWeakGlobalRef",
+    228: "ExceptionCheck", 229: "NewDirectByteBuffer",
+    230: "GetDirectBufferAddress", 231: "GetDirectBufferCapacity",
+    232: "GetObjectRefType",
 }
+
+# AOSP ordering of indices 164-170 (NewStringUTF=164).  Kept for rare
+# binaries compiled against Android's jni.h instead of the Sun spec.
+_JNI_AOSP_STRING = {
+    164: "NewStringUTF",
+    165: "GetStringUTFLength", 166: "GetStringUTFChars",
+    167: "ReleaseStringUTFChars",
+    168: "GetStringLength", 169: "GetStringChars", 170: "ReleaseStringChars",
+}
+
+# Anchor: GetObjectClass = 31, NewStringUTF offset in Sun spec = 167*8=0x538,
+# in AOSP = 164*8=0x520.  We use this to auto-detect table layout.
+_SUN_NEW_STRING_UTF_OFF = 167 * 8
+_AOSP_NEW_STRING_UTF_OFF = 164 * 8
 
 # Complementary (dalvik thread local or ART additions) - rarely needed.
 JNI_RESERVED_SLOTS = 4

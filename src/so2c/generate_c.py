@@ -1,4 +1,11 @@
-"""Generate C/C++ pseudo-source from an Analysis."""
+"""Generate C++/C pseudo-source from an Analysis.
+
+Recent dex2c builds are produced by the new lifting engine; bodies are real
+reconstructions regardless of whether they fit in a .c or .cpp translation
+unit. We emit ``.h`` + ``.cpp`` so callers can compile/lint the pseudo-code
+directly: the JNIEnv uses stay plain C, while the recovered bodies may use
+pseudo-C++ conveniences.
+"""
 
 from __future__ import annotations
 
@@ -13,14 +20,14 @@ from .decompile.arm64 import decompile_function
 
 
 def generate_c(analysis, base, sha256_hex=None):
-    """Write output/*.c / *.h files.  Returns list of (path, is_header)."""
+    """Write output/*.cpp / *.h files.  Returns list of (path, is_header)."""
     elf = analysis.elf
     out_dir = os.path.join(base, "decompiled")
     os.makedirs(out_dir, exist_ok=True)
 
     main_name = _sanitize_filename(elf.soname or "lib")
     header_name = f"{main_name}.h"
-    source_name = f"{main_name}.c"
+    source_name = f"{main_name}.cpp"
 
     header_lines, source_lines = _build_lines(analysis, sha256_hex)
 
@@ -143,13 +150,13 @@ def _build_lines(analysis, sha256_hex):
     return header, source
 
 
-_SIG_RE = re.compile(r'"((?:d2c\$orig\$)[^"]+)"\s*,\s*"((\([^"]*\))[A-Z]?)"')
+_SIG_RE = re.compile(r'"((?:d2c\$orig\$)[^"]+)"\s*,\s*"((\([^"\n]*\))[^"\n]*)"')
 _NAME_RE = re.compile(r'"((?:d2c\$orig\$)[^"]+)"')
 
 
 def _recover_from_body(lines):
-    """Scan pseudo-C lines for a GetMethodID(..,"name","sig") call and return
-    (sig, orig_name) if found."""
+    """Scan pseudo-C lines for a GetMethodID(..,"name","desc") call and return
+    (desc, orig_name) if found."""
     sig = ""
     name = ""
     for line in lines:
