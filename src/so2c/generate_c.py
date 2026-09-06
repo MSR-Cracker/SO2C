@@ -56,13 +56,21 @@ def _build_lines(analysis, sha256_hex):
     arch = analysis.arch
     soname = elf.soname or "lib.so"
 
+    # Recover every function boundary first (exports + internal helpers), so
+    # bodies can name their companions (tail calls, local bl targets) and so
+    # we can forward-declare the internal ones.
+    functions = [f for f in analysis.functions if f.kind != "plt"]
+    func_names = {f.addr: f.short_name for f in functions}
+
     # Decompile everything first so signatures can be recovered from the
     # GetMethodID() descriptor references inside each body.
     bodies = []
     str_idx = _build_str_index(analysis)
     resolver = analysis.resolver
     for j in analysis.jni_exports:
-        lines = decompile_function(elf, resolver, str_idx, j.addr, j.size, j.name)
+        lines = decompile_function(elf, resolver, str_idx, j.addr, j.size,
+                                   j.name, func_names=func_names,
+                                   entry_env=True)
         recovered_sig, recovered_name = _recover_from_body(lines)
         bodies.append({
             "export": j,
@@ -70,6 +78,17 @@ def _build_lines(analysis, sha256_hex):
             "sig": recovered_sig,        # e.g. "(Landroid/view/View;)I"
             "d2c_name": recovered_name,  # e.g. "lambda$0$..."
         })
+
+    internal = []
+    export_addrs = {b["export"].addr for b in bodies}
+    for f in functions:
+        if f.addr in export_addrs:
+            continue
+        addr, size = f.addr, f.size
+        lines = decompile_function(elf, resolver, str_idx, addr, size,
+                                   f.short_name, func_names=func_names,
+                                   entry_env=False)
+        internal.append({"f": f, "lines": lines})
 
     guard = ("SO2C_" + "".join(c.upper() if c.isalnum() else "_"
                                for c in soname) + "_H").replace("__", "_")
@@ -106,6 +125,10 @@ def _build_lines(analysis, sha256_hex):
     source.append("")
     source += render_c_source_declarations(elf, analysis.exports, analysis.imports)
     source.append("")
+    source += render_import_decls(analysis)
+    source.append("")
+    source += _render_internal_decls(internal)
+    source.append("")
     source += render_section_table(elf)
     source.append("")
     source += render_str_table(analysis)
@@ -115,7 +138,7 @@ def _build_lines(analysis, sha256_hex):
     source += render_security(analysis)
     source += [""]
 
-    # ---- decompiled bodies ----
+    # ---- decompiled bodies: exported JNI methods ----
     source.append("/* ========================================================")
     source.append(" * Decompiled JNI entry points (pseudo-C reconstruction)")
     source.append(" * ========================================================")
@@ -147,7 +170,72 @@ def _build_lines(analysis, sha256_hex):
             source.append("    // <no disassembly available>")
         source.append("}")
         source.append("")
+
+    # ---- decompiled bodies: internal / otherwise-unexported functions ----
+    if internal:
+        source.append("/* ========================================================")
+        source.append(" * Internal functions recovered from .text (not exported)")
+        source.append(" * --------------------------------------------------------")
+        source.append(" * These have no ELF symbol, so their C signatures are")
+        source.append(" * unknown; they are declared `static void` and each body")
+        source.append(" * carries an honest note. They are emitted so every byte")
+        source.append(" * of the executable region is accounted for.")
+        source.append(" * ========================================================")
+        source.append("")
+        for it in internal:
+            f = it["f"]
+            source.append("/* -------------------------------------------------")
+            source.append(f" * {f.short_name}  @ {f.addr:#x}  ({f.size} bytes)")
+            source.append(f" *   reason : {f.kind}")
+            source.append(f" *   sig    : unknown (recovered from stripped .text)")
+            source.append(" * ------------------------------------------------- */")
+            source.append(f"static void {f.short_name}(void) {{")
+            source.append("    // signature unknown; do not hand-call with args")
+            lines = it["lines"]
+            if lines:
+                source.extend(lines)
+            else:
+                source.append("    // <no disassembly available>")
+            source.append("}")
+            source.append("")
     return header, source
+
+
+def render_import_decls(analysis):
+    """Forward declarations for imports the generated bodies call, when the
+    real signature is known (compiler-rt / bionic runtime glue)."""
+    known = {
+        "__stack_chk_fail":
+            "extern \"C\" void __stack_chk_fail(void);",
+        "__cxa_finalize":
+            "extern \"C\" void __cxa_finalize(void *dso_handle);",
+        "__cxa_atexit":
+            "extern \"C\" int __cxa_atexit(void (*func)(void *), "
+            "void *arg, void *dso_handle);",
+    }
+    out = ["/* ----- Runtime/compiler-rt imports referenced by bodies ----- */"]
+    emitted = False
+    for imp in analysis.imports:
+        d = known.get(imp.name)
+        if d:
+            out.append(f"    {d}")
+            emitted = True
+    if not emitted:
+        out.append("    // (none of the imports has a known-rendered signature)")
+    out.append("")
+    return out
+
+
+def _render_internal_decls(internal):
+    out = ["/* ----- Internal function forward declarations ----- */"]
+    if not internal:
+        out.append("    // (none)")
+        out.append("")
+        return out
+    for it in internal:
+        out.append(f"static void {it['f'].short_name}(void);")
+    out.append("")
+    return out
 
 
 _SIG_RE = re.compile(r'"((?:d2c\$orig\$)[^"]+)"\s*,\s*"((\([^"\n]*\))[^"\n]*)"')

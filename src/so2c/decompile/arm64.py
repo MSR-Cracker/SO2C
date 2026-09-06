@@ -13,11 +13,20 @@ from __future__ import annotations
 from .lift import Lift, DecompFailure, decompile_aarch64
 
 
-def decompile_function(elf, resolver, str_index, addr, size, name=""):
-    """Public API: decompile one function, return pseudo-C lines."""
+def decompile_function(elf, resolver, str_index, addr, size, name="",
+                       func_names=None, entry_env=None, jni_hint=None):
+    """Public API: decompile one function, return pseudo-C lines.
+
+    ``func_names`` is an {address: sub_XXXX} map used to name tail calls into
+    other recovered functions; ``entry_env`` selects the JNI ABI binding (True
+    for exported JNI methods, False for internal functions whose argument
+    registers are not known).
+    """
     arch = elf.arch_name
     if arch == "aarch64":
-        return decompile_aarch64(elf, resolver, str_index, addr, size, name)
+        return decompile_aarch64(elf, resolver, str_index, addr, size, name,
+                                 jni_hint, func_names=func_names,
+                                 entry_env=entry_env)
     return _generic_decompile(elf, resolver, str_index, addr, size, name)
 
 

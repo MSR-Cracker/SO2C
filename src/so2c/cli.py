@@ -51,6 +51,8 @@ def main(argv=None):
     print(f"[so2c] exports      : {len(analysis.exports)}")
     print(f"[so2c] imports      : {len(analysis.imports)}")
     print(f"[so2c] strings      : {len(analysis.strings)}")
+    print(f"[so2c] funcs        : {len(analysis.functions)} "
+          f"({len([f for f in analysis.functions if f.kind != 'plt'])} in .text)")
 
     analysis.run_deobfuscation()
     if analysis.decoded_strings:

@@ -125,6 +125,9 @@ def render(e) -> str:
         inner = e["v"]
         if isinstance(inner, dict) and inner.get("k") == "var":
             return f"&{inner['v']}"
+        if isinstance(inner, dict) and inner.get("k") == "imm":
+            v = inner["v"]
+            return f"(void*)0x{v:x}" if v else "(void*)0"
         return f"&({render(inner)})"
     if k == "bin":
         return f"({render(e['l'])} {e['op']} {render(e['r'])})"

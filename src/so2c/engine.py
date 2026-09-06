@@ -57,6 +57,18 @@ class Analysis:
         self.decoded_strings = dec.run()
         return self.decoded_strings
 
+    @property
+    def functions(self):
+        """Recovered function list (exported + internal + .plt stubs).
+
+        Computed lazily and cached; see so2c.decompile.functscan for the
+        boundary-recovery algorithm used on stripped binaries.
+        """
+        if getattr(self, "_functions", None) is None:
+            from .decompile.functscan import discover_functions
+            self._functions = discover_functions(self.elf, self.resolver)
+        return self._functions
+
 
 def load_elf(path: str) -> ELFReader:
     with open(path, "rb") as f:
@@ -185,6 +197,16 @@ def write_summary(analysis, base):
         "pie": analysis.security.get("pie"),
     }
 
+    functions = []
+    for f in analysis.functions:
+        functions.append({
+            "address": f.addr,
+            "size": f.size,
+            "kind": f.kind,
+            "name": f.short_name,
+            "section": f.section,
+        })
+
     result = {
         "meta": meta,
         "sections": sections,
@@ -196,6 +218,7 @@ def write_summary(analysis, base):
         "registered_natives": registered_out,
         "security": security,
         "exec_ranges": analysis.exec_ranges,
+        "functions": functions,
     }
 
     with open(os.path.join(summary_dir, "analysis.json"), "w") as f:
@@ -203,6 +226,7 @@ def write_summary(analysis, base):
 
     write_strings_txt(analysis, summary_dir)
     write_exports_txt(analysis, summary_dir)
+    write_functions_txt(analysis, summary_dir)
     return result
 
 
@@ -225,4 +249,14 @@ def write_exports_txt(analysis, summary_dir):
         f.write(f"{'address':>12} {'size':>8} {'type':<7} {'bind':<7}  name\n")
         for e in analysis.exports:
             f.write(f"{e.addr:#010x} {e.size:>8} {e.type:<7} {e.bind:<7}  {e.name}\n")
+    return path
+
+
+def write_functions_txt(analysis, summary_dir):
+    path = os.path.join(summary_dir, "functions.txt")
+    with open(path, "w") as f:
+        f.write("# SO2C recovered functions (exports + internal + .plt stubs)\n")
+        f.write("#       address  size     kind  section  name\n")
+        for fn in analysis.functions:
+            f.write(f"{fn.addr:#010x} {fn.size:>6}  {fn.kind:<9} {fn.section:<7}  {fn.short_name}\n")
     return path

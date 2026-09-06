@@ -13,11 +13,33 @@ shared library (or any ELF) and produces:
   (single-byte XOR candidates against `.rodata`)
 * JNI-aware decompilation: JNIEnv vtable calls are resolved to their
   JNI method names, string literals and relocation targets are recovered
+* function-boundary recovery: exported **and** internal (non-symbolic)
+  functions are discovered from `.text`, with gap-free, 4-byte aligned
+  coverage of the whole executable range
 * readable C/C++ pseudo-source in `output/`
 
 It is built to handle **stripped** libraries: when `.symtab` is absent we
 still recover every exported dynamic symbol, JNI name demangling, and (with
-capstone) a full disassembly of each exported function.
+capstone) a full disassembly of each exported function.  Function discovery
+uses a hybrid recursive-descent + anchor algorithm so every function in the
+executable region — not just the exported ones — is accounted for, even when
+no symbol table is present.
+
+## Function discovery
+
+For stripped binaries the exports alone only cover part of `.text`.  SO2C
+recovers **all** functions by combining two strategies:
+
+* **Recursive descent** from known entry points (exports and PLT resolvers):
+  follow conditional branches, tail `b` jumps and `bl`/`blr` targets.
+* **Anchor scanning**: fixpoint over unreached runs, treating any run whose
+  preceding instruction is a control-flow terminator (`ret`/`br`/`b`) as a
+  new function start.
+
+The result is a gap-free, non-overlapping partition of every executable
+region, so internal helpers, trampolines and cold blocks that a stripped
+ELF would otherwise hide show up in the decompiled output (`static void
+sub_XXXX` bodies in the `.cpp`).
 
 ## Architecture support
 
@@ -44,6 +66,7 @@ python -m so2c input/lib.so -o output
 
 # 3. outputs
 #    output/summary/analysis.json  - full machine-readable analysis
+#    output/summary/functions.txt  - recovered function table (exports + internal)
 #    output/summary/strings.txt    - extracted string constants
 #    output/summary/exports.txt    - recovered exported symbols
 #    output/decompiled/*.cpp/.h    - reconstructed C++ pseudo-source
@@ -77,7 +100,21 @@ src/so2c/
   cli.py      command line entry point
   engine.py   analysis orchestration
   generate_c.py
+tests/        regression suite (pytest; needs input/lib.so)
 ```
+
+## Development
+
+```bash
+pip install -e '.[dev]'
+python -m pytest tests
+```
+
+The test suite (`tests/`) covers function-boundary recovery, the AArch64
+lifter unit paths (store/load disambiguation, condition mapping, constant and
+address rendering), end-to-end JNI decompilation with stack-canary recovery,
+and the generated `.cpp`/`.h` structure.  Tests requiring the sample
+`input/lib.so` are skipped automatically when it is absent.
 
 ## Notes on fidelity
 

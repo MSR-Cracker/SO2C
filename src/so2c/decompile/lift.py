@@ -106,7 +106,14 @@ _JNI_ARITY = {
 
 _ARG_REGS = ("x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7")
 
-_STORE_MNEM = ("str", "stur", "strb", "strh")
+# known fixed arity of libc/compiler-rt runtime calls this tool emits
+_IMPORT_ARITY = {
+    "__stack_chk_fail": 0,
+    "__cxa_finalize": 1,
+    "__cxa_atexit": 3,
+}
+
+_STORE_MNEM = ("str", "stur", "strb", "strh", "stp", "stnp")
 
 
 def _is_store(m):
@@ -156,11 +163,14 @@ class Lift:
         self.labels = set()      # branch target addresses
         self.phi = {}            # label addr -> set(render strings)
         self.lines = []
+        self.prelude = []        # local declarations hoisted to the top
+        self._declarations_emitted = set()
         self.var_counter = [0]
         self.param_exprs = {}    # reg name -> param Expr dict
         self._emitted = set()
         self._jni_used = set()
         self.entry_x0_env = False
+        self.func_names = {}     # addr -> sub_XXXX map for known functions
 
     # ------------------------------------------------------------------ utils
     def _new_var(self, hint="v"):
@@ -175,6 +185,18 @@ class Lift:
             self.regs.pop(reg, None)
         else:
             self.regs[reg] = e
+
+    def _emit_decls(self, decls):
+        """Push local variable declarations into the function prelude.
+
+        Declarations are emitted at most once (subsequent calls with the same
+        text are harmless), so they are safe to insert speculatively from deep
+        within the decoder.
+        """
+        for d in decls:
+            if d not in self._declarations_emitted:
+                self.prelude.append(f"    {d}")
+                self._declarations_emitted.add(d)
 
     def _str_at(self, addr):
         if isinstance(addr, int):
@@ -215,13 +237,18 @@ class Lift:
         return E.render(e) if e is not None else "?"
 
     # ------------------------------------------------------------------ entry
-    def decompile(self, addr, size, name="", jni_hint=None):
+    def decompile(self, addr, size, name="", jni_hint=None,
+                  func_names=None, entry_env=None):
         self.insns = disassemble_detailed(self.elf, addr, size)
         if not self.insns:
             return []
         self.addr = addr
         self.size = size
         self.name = name
+        if func_names:
+            self.func_names.update(func_names)
+        if entry_env is not None:
+            self.entry_x0_env = entry_env
 
         self._collect_labels()
         self._init_entry_params(name or jni_hint)
@@ -244,7 +271,7 @@ class Lift:
                         f"    // join: return value is one of "
                         f"{', '.join(sorted(phis))}")
             self._lift_insn(insn)
-        return self.lines
+        return self.prelude + self.lines
 
     def _collect_labels(self):
         import struct
@@ -262,28 +289,38 @@ class Lift:
         self.labels = labels
 
     def _init_entry_params(self, name):
-        """Bind JNI ABI entry registers (env, thiz, java params)."""
-        self._set("x0", E.env())
-        self._set("w0", E.env())
-        self.entry_x0_env = True
-        self._set("x1", E.param(1, "thiz"))
-        self._set("w1", E.param(1, "thiz"))
+        """Bind JNI ABI entry registers (env, thiz, java params).
 
-        params = _params_from_name(name)
-        self.params = params
-        gp = 2        # next general-purpose arg register (x2..)
-        fp = 0        # next floating-point arg register (s0..)
-        for i, (typ, n) in enumerate(params):
-            if typ in ("jfloat", "jdouble"):
-                sreg = f"s{fp}"
-                dreg = f"d{fp}"
-                fp += 1
-                self._set(sreg, E.param(i, n))
-                self._set(dreg, E.param(i, n))
-            else:
-                self._set(f"x{gp}", E.param(i, n))
-                self._set(f"w{gp}", E.param(i, n))
-                gp += 1
+        For exported JNI methods x0 is the JNIEnv* and x1 the receiver; for
+        internal (recovered, unnamed) functions the ABI registers are ordinary
+        unknown parameters, so nothing gets bound and x0..x7 stay implicit.
+        """
+        self.params = _params_from_name(name)
+        if self.entry_x0_env:
+            self._set("x0", E.env())
+            self._set("w0", E.env())
+            self._set("x1", E.param(1, "thiz"))
+            self._set("w1", E.param(1, "thiz"))
+            gp = 2        # next general-purpose arg register (x2..)
+            fp = 0        # next floating-point arg register (s0..)
+            for i, (typ, n) in enumerate(self.params):
+                if typ in ("jfloat", "jdouble"):
+                    sreg = f"s{fp}"
+                    dreg = f"d{fp}"
+                    fp += 1
+                    self._set(sreg, E.param(i, n))
+                    self._set(dreg, E.param(i, n))
+                else:
+                    self._set(f"x{gp}", E.param(i, n))
+                    self._set(f"w{gp}", E.param(i, n))
+                    gp += 1
+            return
+
+        # internal function: keep the ABI argument registers implicit (do not
+        # invent names); any register that reaches output is rendered by its
+        # real AArch64 name, which is the honest notation for a function whose
+        # calling convention is unknown.
+        return
 
     def _analyze_frame(self):
         import itertools
@@ -328,7 +365,7 @@ class Lift:
             self._lift_mrs(insn)
             return
         if m in ("ldr", "ldur", "ldp", "ldnp", "ldrsw", "ldrb", "ldrh",
-                 "prfm", "str", "stur", "stp", "strb", "strh"):
+                 "prfm", "str", "stur", "stp", "stnp", "strb", "strh"):
             self._lift_ld_st(insn)
             return
         if m == "ret":
@@ -360,9 +397,12 @@ class Lift:
         if m in ("fmov", "movi", "fmov") or m.startswith("f"):
             self._lift_fp(insn)
             return
-        if m in ("csel", "cset", "csinc", "csinv", "csneg", "ccmp", "ccmn",
-                 "cinc", "cinv", "cneg"):
-            self.lines.append(f"    // {insn.text}")
+        if m in ("csel", "cset", "csinc", "csinv", "csneg", "cinc", "cinv",
+                 "cneg"):
+            self._lift_select(insn)
+            return
+        if m in ("ccmp", "ccmn"):
+            self.lines.append(f"    // {insn.text}  ; conditional flags set")
             return
         self.lines.append(f"    // {insn.text}")
 
@@ -454,11 +494,26 @@ class Lift:
 
         if m in ("movz", "movn", "movk") and len(ops) >= 2 \
            and ops[0].kind == "reg" and ops[1].kind == "imm":
-            v = ops[1].imm
+            v = ops[1].imm & 0xFFFF
+            lane = 0
+            if len(ops) >= 3 and ops[2].kind == "imm":
+                lane = ops[2].imm
+            mask = 0xFFFFFFFF if ops[0].reg.startswith("w") else \
+                0xFFFFFFFFFFFFFFFF
+            if m == "movk":
+                # lanes accumulate: movk merges into the previously built value
+                cur = self._got(ops[0].reg)
+                basev = 0
+                if E.kind_of(cur) == "imm":
+                    basev = cur["v"]
+                merged = (basev & ~(0xFFFF << lane)) | (v << lane)
+                self._set(ops[0].reg, E.imm(merged & mask))
+                return
             if m == "movn":
-                v = ~v & 0xFFFFFFFFFFFFFFFF
-            if m in ("movz", "movn"):
-                self._set(ops[0].reg, E.imm(v))
+                full = (~(ops[1].imm << lane)) & mask
+            elif m == "movz":
+                full = (ops[1].imm << lane) & mask
+            self._set(ops[0].reg, E.imm(full))
             return
 
         if m == "add" and len(ops) == 3 and ops[0].kind == "reg" \
@@ -528,6 +583,11 @@ class Lift:
             return
         base, disp, acc = mem
         store = _is_store(m)
+        pair = m in ("stp", "stnp", "ldp", "ldnp")
+        regs = []
+        for o in ops:
+            if o.kind == "reg" and len(regs) < (2 if pair else 1):
+                regs.append(o.reg)
 
         # vector reg access is a spill/restore; keep a comment only for stores
         if store and base not in ("sp", "x29"):
@@ -541,18 +601,21 @@ class Lift:
 
         fo = self._frame_off(base, disp)
 
-        # ---- store into the jvalue args region
+        # ---- store into the jvalue args region (single + pair stores)
         if store and self.args_base is not None and \
                 fo is not None and fo >= self.args_base:
-            self._lift_arg_store(insn, fo)
+            for i, r in enumerate(regs[:2]):
+                self._lift_arg_store_idx(insn, fo + i * 8, r)
             return
 
-        # ---- canary save slot
-        if store and fo is not None:
+        # ---- canary save slot (single store of the guard value)
+        if store and fo is not None and not pair:
             val = self._got(_first_reg(ops)) if _first_reg(ops) else None
             if E.kind_of(val) == "sym" and val.get("v") == "__stack_chk_guard":
                 self.canary_slot = fo
                 self.canary_var = "canary"
+                self._emit_decls({"uintptr_t canary;",
+                                  "extern uintptr_t __stack_chk_guard;"})
                 self.lines.append(f"    // guard saved at frame+0x{fo:x}")
                 return
 
@@ -579,25 +642,44 @@ class Lift:
             self._set(_first_reg(ops), E.envfn())
             return
 
-        # ---- [xN,#disp] string / other loads
+        # ---- [xN,#disp] loads where xN holds a resolved address / constant
         if not store:
             src = self._got(base)
-            if E.kind_of(src) == "addr" or E.kind_of(src) == "imm":
-                total = None
-                if E.kind_of(src) == "addr" and isinstance(src.get("v"), dict) \
-                        and src["v"].get("k") == "imm":
-                    total = src["v"]["v"] + disp
-                elif E.kind_of(src) == "imm":
-                    total = src["v"] + disp
-                if total is not None:
-                    s = self._str_at(total)
-                    if s:
-                        self._set(_first_reg(ops), E.string(s, total))
-                        return
-            self._set(_first_reg(ops), E.mem(E.reg(base), disp, 8))
+            total = None
+            if E.kind_of(src) == "addr" and isinstance(src.get("v"), dict) \
+                    and src["v"].get("k") == "imm":
+                total = src["v"]["v"] + disp
+            elif E.kind_of(src) == "imm":
+                total = src["v"] + disp
+            if total is not None:
+                if pair:
+                    pass
+                s = self._str_at(total)
+                if s:
+                    self._set(_first_reg(ops), E.string(s, total))
+                    return
+                g = self.resolver.got_name(total)
+                if g:
+                    self._set(_first_reg(ops), E.sym(g))
+                    return
+                self._set(_first_reg(ops), E.mem(None, total, 8))
+                return
+
+        # ---- plain frame-relative store: keep an honest comment
+        if store:
+            self.lines.append(f"    // {insn.text}")
             return
 
-        self.lines.append(f"    // {insn.text}")
+        # ---- pair loads: restore both registers from memory
+        if pair:
+            for i, r in enumerate(regs[:2]):
+                off = disp + i * 8
+                self._set(r, E.mem(E.reg(base), off, 8))
+            return
+
+        # ---- plain [xN,#disp] load of an untracked base
+        self._set(_first_reg(ops), E.mem(E.reg(base), disp, 8))
+        return
 
     def _lift_ldr_literal(self, insn):
         t = _insn_target(insn, insn.operands)
@@ -622,20 +704,17 @@ class Lift:
                     return
         self._set(rd, E.addr_of(E.imm(t)))
 
-    def _lift_arg_store(self, insn, fo):
-        ops = insn.operands
-        m = insn.mnemonic
-        reg = _first_reg(ops)
+    def _lift_arg_store_idx(self, insn, fo, reg):
         val = self._got(reg)
         if val is None:
             val = E.reg(reg)
         idx = (fo - self.args_base) // 8
         # field by param type if known
         field = ""
-        if E.kind_of(val) == "param":
+        if E.kind_of(val) == "param" and self.params and \
+                E.value_of(val) < len(self.params):
             field = _jvalue_field(self.params[E.value_of(val)][0] if
-                                  self.params and
-                                  E.value_of(val) < len(self.params) else "")
+                                  self.params else "")
         if not field:
             field = _store_field(insn)
         self.args_stores.append((idx, val, field))
@@ -644,12 +723,16 @@ class Lift:
     # ------------------------------------------------------------------ calls
     def _lift_bl(self, insn):
         tgt = _insn_target(insn, insn.operands)
-        nm = self.resolver.resolve(tgt) if tgt is not None else None
-        if nm:
-            self.lines.append(f"    {nm}();")
+        if tgt is not None:
+            nm = self.resolver.resolve(tgt)
+            if nm is None and self.func_names:
+                nm = self.func_names.get(tgt)
+            if nm:
+                self.lines.append(f"    {nm}();")
+            else:
+                self.lines.append(f"    // bl 0x{tgt:x}")
         else:
-            self.lines.append(f"    // bl 0x{tgt:x}" if tgt else
-                              f"    // {insn.text}")
+            self.lines.append(f"    // {insn.text}")
         self._clobber_caller_saved()
 
     def _lift_br(self, insn, tail=False):
@@ -779,10 +862,46 @@ class Lift:
     # ------------------------------------------------------------------ branch
     def _lift_b(self, insn):
         tgt = _insn_target(insn, insn.operands)
-        if tgt is not None:
-            self.lines.append(f"    goto L_0x{tgt:x};")
-        else:
+        if tgt is None:
             self.lines.append(f"    // {insn.text}")
+            return
+        imp = self.resolver.resolve(tgt) if self.resolver.inside_plt(tgt) \
+            else None
+        if imp is not None:
+            args = self._collect_import_args(tgt, imp)
+            if args is not None:
+                self.lines.append(
+                    f"    {imp}({', '.join(args)});   // tail call "
+                    f"(no return to caller)")
+            else:
+                self.lines.append(
+                    f"    // tail call -> {imp}()   ; argument registers "
+                    f"not resolved")
+            return
+        if self.func_names and tgt in self.func_names and tgt != self.addr:
+            nm = self.func_names[tgt]
+            self.lines.append(f"    {nm}();   // tail call")
+            return
+        # an unconditional fast-path jump inside the function (loops /
+        # join blocks) still needs the target label.
+        self.lines.append(f"    goto L_0x{tgt:x};")
+
+    def _collect_import_args(self, tgt, name):
+        """Render the argument registers for a tail call to an import, if all
+        of its (known) arguments are still tracked."""
+        arity = _IMPORT_ARITY.get(name)
+        if arity is None:
+            return None
+        args = []
+        for i in range(arity):
+            e = self._got(f"x{i}")
+            if e is None:
+                return None
+            r = self._render(e)
+            if r in ("?", "/* ??? */"):
+                return None
+            args.append(r)
+        return args
 
     def _lift_cond(self, insn):
         m = insn.mnemonic
@@ -806,25 +925,31 @@ class Lift:
         if m.startswith("b."):
             suffix = m[2:]
             cmp = self.last_cmp
+            self.last_cmp = None  # flags are consumed by a conditional branch
             # canary failure: (__stack_chk_guard != canary)
             if cmp and suffix == "ne" and self._is_canary_cmp(cmp):
                 self.lines.append(
                     f"    if (__stack_chk_guard != {cmp[1]}) "
                     f"goto L_0x{tgt:x};   // stack smashing")
-                self.last_cmp = None
                 return
-            if suffix == "eq" and self._is_canary_cmp(cmp):
+            if cmp and suffix == "eq" and self._is_canary_cmp(cmp):
                 self.lines.append(
                     f"    if (__stack_chk_guard == {cmp[1]}) "
                     f"goto L_0x{tgt:x};")
-                self.last_cmp = None
                 return
             self._record_phi(tgt)
-            op = _aarch64_simple_cond(suffix)
-            if op is None:
+            if cmp is not None and isinstance(cmp, tuple) and len(cmp) == 2 \
+                    and cmp[0] != "__stack_chk_guard":
+                op = _cond_operator(suffix)
+                if op is not None and cmp[1] not in ("?", "/* ??? */"):
+                    self.lines.append(
+                        f"    if ({cmp[0]} {op} {cmp[1]}) goto L_0x{tgt:x};")
+                    return
+            ref = _aarch64_simple_cond(suffix)
+            if ref is None:
                 self.lines.append(f"    // {insn.text}")
                 return
-            self.lines.append(f"    if {op} goto L_0x{tgt:x};")
+            self.lines.append(f"    if {ref} goto L_0x{tgt:x};")
             return
 
         if m in ("tbz", "tbnz"):
@@ -897,19 +1022,106 @@ class Lift:
         lhs, rhs = cmp
         return lhs == "__stack_chk_guard" and rhs == "canary"
 
+    # ------------------------------------------------------------------ select
+    def _lift_select(self, insn):
+        m = insn.mnemonic
+        ops = insn.operands
+        rd = self._rd(insn)
+        if rd is None:
+            self.lines.append(f"    // {insn.text}")
+            return
+        # capstone folds the condition into op_str instead of an operand
+        cond = "al"
+        parts = insn.op_str.split(",")
+        if len(parts) >= 2 and parts[-1].strip().lower() in (
+                "eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl", "vs", "vc",
+                "hi", "ls", "ge", "lt", "gt", "le", "al"):
+            cond = parts[-1].strip().lower()
+        cond_txt = self._cond_text(cond)
+
+        rn = None
+        rm = None
+        if m in ("csel", "csinc", "csinv", "csneg") and len(ops) >= 3:
+            rn = self._got(ops[1].reg) if ops[1].kind == "reg" else None
+            rm = self._got(ops[2].reg) if ops[2].kind == "reg" else None
+        elif m in ("cinc", "cinv", "cneg", "cset") and len(ops) >= 1:
+            pass
+        if rn is None and len(ops) >= 2 and ops[1].kind == "reg":
+            rn = self._got(ops[1].reg)
+
+        rn_t = self._render(rn) if rn is not None else "0"
+        rm_t = self._render(rm) if rm is not None else "0"
+
+        if m == "csel":
+            self.lines.append(f"    {rd} = {cond_txt} ? {rn_t} : {rm_t};")
+            return
+        if m == "cset":
+            self.lines.append(f"    {rd} = {cond_txt} ? 1 : 0;")
+            return
+        if m == "cinc":
+            self.lines.append(f"    {rd} = {cond_txt} ? {rn_t} + 1 : {rn_t};")
+            return
+        if m == "cinv":
+            self.lines.append(f"    {rd} = {cond_txt} ? ~({rn_t}) : {rn_t};")
+            return
+        if m == "cneg":
+            self.lines.append(f"    {rd} = {cond_txt} ? -({rn_t}) : {rn_t};")
+            return
+        if m in ("csinc", "csinv", "csneg"):
+            op = {"csinc": "+1", "csinv": "~", "csneg": "-"}.get(m, "+1")
+            self.lines.append(f"    {rd} = {cond_txt} ? {rn_t} : "
+                              f"{op}({rm_t});")
+            return
+        self.lines.append(f"    // {insn.text}")
+
+    def _cond_text(self, suffix):
+        """Render a condition for the current flags state.
+
+        If a tracked ``cmp`` is pending, produce a real C comparison; otherwise
+        fall back to an honest ``(flags XX)`` placeholder (the flags are real,
+        the operands simply were not worth tracking).
+        """
+        cmp = self.last_cmp
+        if cmp is not None and isinstance(cmp, tuple) and len(cmp) == 2:
+            lhs, rhs = cmp
+            op = _cond_operator(suffix)
+            if op and lhs != "__stack_chk_guard":
+                return f"({lhs} {op} {rhs})"
+        return f"(flags {suffix.upper()})"
+
     # ------------------------------------------------------------------ cmp
     def _lift_cmp(self, insn):
         ops = insn.operands
-        if len(ops) >= 2:
-            lhs = self._got(ops[0].reg) if ops[0].kind == "reg" else None
-            rhs = self._got(ops[1].reg) if len(ops) > 1 and \
-                ops[1].kind == "reg" else None
+        lhs = rhs = None
+        if ops and ops[0].kind == "reg":
+            lhs = self._got(ops[0].reg)
+            lhs_t = self._render(lhs)
+            if lhs_t in ("?", "/* ??? */"):
+                lhs_t = ops[0].reg
+            if len(ops) > 1:
+                o2 = ops[1]
+                if o2.kind == "reg":
+                    rhs = self._got(o2.reg)
+                    rhs_t = self._render(rhs)
+                    if rhs_t in ("?", "/* ??? */"):
+                        rhs_t = o2.reg
+                elif o2.kind == "imm":
+                    v = o2.imm
+                    rhs_t = f"0x{v:x}" if v > 0x7FFFFFFF else str(v)
+                    rhs = E.imm(v)
+            else:
+                rhs_t = "0"
+            # stack-canary guard compare (used by _lift_cond for b.ne/b.eq)
             if E.kind_of(lhs) == "sym" and lhs.get("v") == "__stack_chk_guard":
-                self.last_cmp = ("__stack_chk_guard", self._render(rhs))
+                self.last_cmp = ("__stack_chk_guard", rhs_t)
                 return
             if E.kind_of(rhs) == "sym" and rhs.get("v") == "__stack_chk_guard":
-                self.last_cmp = ("__stack_chk_guard", self._render(lhs))
+                self.last_cmp = ("__stack_chk_guard", lhs_t)
                 return
+            if lhs_t is not None and rhs_t is not None:
+                self.last_cmp = (lhs_t, rhs_t)
+                if insn.mnemonic in ("cmp", "cmn"):
+                    return
         self.last_cmp = None
         self.lines.append(f"    // {insn.text}  ; flags set")
 
@@ -1035,5 +1247,19 @@ def _aarch64_simple_cond(suffix):
     }.get(suffix)
 
 
-def decompile_aarch64(elf, resolver, str_index, addr, size, name="", jni_hint=None):
-    return Lift(elf, resolver, str_index).decompile(addr, size, name, jni_hint)
+def _cond_operator(suffix):
+    """C comparison operator for a branch/select condition when the operands
+    of the preceding cmp/cmn are known."""
+    return {
+        "eq": "==", "ne": "!=",
+        "lt": "<", "le": "<=", "gt": ">", "ge": ">=",
+        "lo": "<", "ls": "<=", "hi": ">", "hs": ">=", "cs": ">=",
+        "cc": "<",
+    }.get(suffix)
+
+
+def decompile_aarch64(elf, resolver, str_index, addr, size, name="",
+                      jni_hint=None, func_names=None, entry_env=None):
+    return Lift(elf, resolver, str_index).decompile(
+        addr, size, name, jni_hint, func_names=func_names,
+        entry_env=entry_env)
